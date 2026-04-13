@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from pydantic import BaseModel
+from datetime import datetime, timedelta
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
 
 app = FastAPI(title="Factory Inventory Management System")
@@ -119,6 +120,123 @@ class CreatePurchaseOrderRequest(BaseModel):
     unit_cost: float
     expected_delivery_date: str
     notes: Optional[str] = None
+
+class RestockRecommendation(BaseModel):
+    item_sku: str
+    item_name: str
+    category: str
+    forecasted_demand: int
+    current_stock: int
+    stock_gap: int
+    recommended_qty: int
+    unit_cost: float
+    line_cost: float
+    trend: str
+    lead_time_days: int
+
+class RestockingOrderItem(BaseModel):
+    item_sku: str
+    item_name: str
+    category: str
+    quantity: int
+    unit_cost: float
+    line_cost: float
+    lead_time_days: int
+
+class RestockingOrder(BaseModel):
+    id: str
+    order_number: str
+    items: List[RestockingOrderItem]
+    total_value: float
+    budget: float
+    status: str
+    submitted_at: str
+    expected_delivery: str
+    lead_time_days: int
+
+class CreateRestockingOrderRequest(BaseModel):
+    budget: float
+    items: List[RestockingOrderItem]
+
+
+# --- Restocking helpers -------------------------------------------------------
+
+# Demand-forecast SKUs don't all exist in inventory.json; map missing ones to a
+# real category so per-category lead-time and unit-cost lookups stay consistent.
+CATEGORY_LEAD_TIME_DAYS = {
+    "Circuit Boards": 7,
+    "Sensors": 5,
+    "Actuators": 10,
+    "Controllers": 12,
+    "Power Supplies": 6,
+}
+
+CATEGORY_DEFAULT_COST = {
+    "Circuit Boards": 24.99,
+    "Sensors": 14.50,
+    "Actuators": 89.00,
+    "Controllers": 110.00,
+    "Power Supplies": 18.99,
+}
+
+SKU_PREFIX_CATEGORY = {
+    "PCB": "Circuit Boards",
+    "SNR": "Sensors",
+    "MTR": "Actuators",
+    "VLV": "Actuators",
+    "CTL": "Controllers",
+    "PSU": "Power Supplies",
+    "WDG": "Actuators",
+    "BRG": "Actuators",
+    "GSK": "Sensors",
+    "FLT": "Sensors",
+}
+
+_inventory_by_sku = {item["sku"]: item for item in inventory_items}
+restocking_orders: list[dict] = []
+
+
+def _category_for_sku(sku: str) -> str:
+    inv = _inventory_by_sku.get(sku)
+    if inv:
+        return inv["category"]
+    prefix = sku.split("-")[0]
+    return SKU_PREFIX_CATEGORY.get(prefix, "Controllers")
+
+
+def _unit_cost_for_sku(sku: str, category: str) -> float:
+    inv = _inventory_by_sku.get(sku)
+    if inv:
+        return inv["unit_cost"]
+    return CATEGORY_DEFAULT_COST.get(category, 50.0)
+
+
+def _build_recommendations() -> list[dict]:
+    recs = []
+    for f in demand_forecasts:
+        sku = f["item_sku"]
+        inv = _inventory_by_sku.get(sku)
+        category = _category_for_sku(sku)
+        current_stock = inv["quantity_on_hand"] if inv else f.get("current_demand", 0)
+        gap = f["forecasted_demand"] - current_stock
+        recommended_qty = max(gap, 0)
+        unit_cost = _unit_cost_for_sku(sku, category)
+        lead_time = CATEGORY_LEAD_TIME_DAYS.get(category, 7)
+        recs.append({
+            "item_sku": sku,
+            "item_name": f["item_name"],
+            "category": category,
+            "forecasted_demand": f["forecasted_demand"],
+            "current_stock": current_stock,
+            "stock_gap": gap,
+            "recommended_qty": recommended_qty,
+            "unit_cost": unit_cost,
+            "line_cost": round(recommended_qty * unit_cost, 2),
+            "trend": f.get("trend", "stable"),
+            "lead_time_days": lead_time,
+        })
+    recs.sort(key=lambda r: r["stock_gap"], reverse=True)
+    return recs
 
 # API endpoints
 @app.get("/")
@@ -303,6 +421,57 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+@app.get("/api/restocking/recommendations", response_model=List[RestockRecommendation])
+def get_restocking_recommendations():
+    """Items recommended for restocking, ranked by stock gap (forecast - current)."""
+    return _build_recommendations()
+
+
+@app.post("/api/restocking/orders", response_model=RestockingOrder)
+def create_restocking_order(req: CreateRestockingOrderRequest):
+    """Submit a restocking order; persisted in-memory until server restart."""
+    if not req.items:
+        raise HTTPException(status_code=400, detail="At least one item is required")
+
+    items = []
+    for it in req.items:
+        category = it.category or _category_for_sku(it.item_sku)
+        lead = CATEGORY_LEAD_TIME_DAYS.get(category, 7)
+        items.append({
+            "item_sku": it.item_sku,
+            "item_name": it.item_name,
+            "category": category,
+            "quantity": it.quantity,
+            "unit_cost": it.unit_cost,
+            "line_cost": round(it.quantity * it.unit_cost, 2),
+            "lead_time_days": lead,
+        })
+
+    total_value = round(sum(i["line_cost"] for i in items), 2)
+    order_lead = max(i["lead_time_days"] for i in items)
+    now = datetime.now()
+    order_id = str(len(restocking_orders) + 1)
+    order = {
+        "id": order_id,
+        "order_number": f"RST-{now.year}-{int(order_id):04d}",
+        "items": items,
+        "total_value": total_value,
+        "budget": req.budget,
+        "status": "Submitted",
+        "submitted_at": now.isoformat(timespec="seconds"),
+        "expected_delivery": (now + timedelta(days=order_lead)).isoformat(timespec="seconds"),
+        "lead_time_days": order_lead,
+    }
+    restocking_orders.append(order)
+    return order
+
+
+@app.get("/api/restocking/orders", response_model=List[RestockingOrder])
+def get_restocking_orders():
+    """All submitted restocking orders (newest first)."""
+    return list(reversed(restocking_orders))
+
 
 if __name__ == "__main__":
     import uvicorn
